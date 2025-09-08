@@ -1,0 +1,1154 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2023-2024 SGLang Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+import traceback
+import uuid
+from collections import defaultdict
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from enum import Enum
+from pprint import pprint
+from typing import Any, Optional
+
+import numpy as np
+import ray
+import torch
+from codetiming import Timer
+from omegaconf import OmegaConf, open_dict
+from torch.utils.data import Dataset, Sampler, default_collate
+from torchdata.stateful_dataloader import StatefulDataLoader
+from tqdm import tqdm
+
+
+from offline_dpo_dataset import OfflineDPODataset
+
+
+from recipe.dpo import core_algos
+from verl import DataProto
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.single_controller.base import Worker
+from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
+from verl.single_controller.ray.base import create_colocated_worker_cls
+from verl.trainer.ppo.metric_utils import (
+    compute_throughout_metrics,
+    compute_timing_metrics,
+    process_validation_metrics,
+    reduce_metrics,
+)
+from verl.trainer.ppo.ray_trainer import Role
+from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
+from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.torch_functional import masked_mean
+from verl.utils.tracking import ValidationGenerationsLogger
+
+WorkerType = type[Worker]
+
+
+class AdvantageEstimator(str, Enum):
+    """
+    Using an enumeration class to avoid spelling errors in adv_estimator
+    """
+
+    GAE = "gae"
+    GRPO = "grpo"
+    REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
+    REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
+    REMAX = "remax"
+    RLOO = "rloo"
+
+
+@dataclass
+class ResourcePoolManager:
+    """
+    Define a resource pool specification. Resource pool will be initialized first.
+    Mapping
+    """
+
+    resource_pool_spec: dict[str, list[int]]
+    mapping: dict[Role, str]
+    resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
+
+    def create_resource_pool(self):
+        for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
+            # max_colocate_count means the number of WorkerGroups (i.e. processes) in each RayResourcePool
+            # For FSDP backend, we recommend using max_colocate_count=1 that merge all WorkerGroups into one.
+            # For Megatron backend, we recommend using max_colocate_count>1 that can utilize different
+            # WorkerGroup for different models
+            resource_pool = RayResourcePool(
+                process_on_nodes=process_on_nodes, use_gpu=True, max_colocate_count=1, name_prefix=resource_pool_name
+            )
+            self.resource_pool_dict[resource_pool_name] = resource_pool
+
+        self._check_resource_available()
+
+    def get_resource_pool(self, role: Role) -> RayResourcePool:
+        """Get the resource pool of the worker_cls"""
+        return self.resource_pool_dict[self.mapping[role]]
+
+    def get_n_gpus(self) -> int:
+        """Get the number of gpus in this cluster."""
+        return sum([n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes])
+
+    def _check_resource_available(self):
+        """Check if the resource pool can be satisfied in this ray cluster."""
+        node_available_resources = ray.state.available_resources_per_node()
+        node_available_gpus = {node: node_info.get("GPU", 0) for node, node_info in node_available_resources.items()}
+
+        # check total required gpus can be satisfied
+        total_available_gpus = sum(node_available_gpus.values())
+        total_required_gpus = sum(
+            [n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes]
+        )
+        if total_available_gpus < total_required_gpus:
+            raise ValueError(
+                f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}"
+            )
+
+        # check each resource pool can be satisfied, O(#resource_pools * #nodes)
+        for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
+            num_gpus, num_nodes = process_on_nodes[0], len(process_on_nodes)
+            for node, available_gpus in node_available_gpus.items():
+                if available_gpus >= num_gpus:
+                    node_available_gpus[node] -= num_gpus
+                    num_nodes -= 1
+                    if num_nodes == 0:
+                        break
+            if num_nodes > 0:
+                raise ValueError(
+                    f"Resource pool {resource_pool_name}: {num_gpus}*{num_nodes} cannot be satisfied in this "
+                    f"ray cluster"
+                )
+
+
+def _compute_response_info(batch: DataProto) -> dict[str, Any]:
+    """Placeholder: Computes prompt and response lengths."""
+    try:
+        # Assuming 'prompts' and 'responses' keys exist after generation/union
+        prompt_len = batch.batch["prompts"].shape[1]
+        resp_len = batch.batch["responses"].shape[1]
+        # This is simplified - real implementation might use attention masks
+        # to get actual lengths per sample.
+        batch_size = batch.batch.batch_size[0]
+        prompt_lengths_tensor = torch.full((batch_size,), prompt_len, dtype=torch.float32, device=batch.batch.device)
+        response_lengths_tensor = torch.full((batch_size,), resp_len, dtype=torch.float32, device=batch.batch.device)
+
+        # Try getting actual lengths from attention mask if possible (more accurate)
+        if "response_mask" in batch.batch:
+            response_lengths_tensor = batch.batch["response_mask"].sum(dim=1).float()
+            prompt_lengths_tensor = torch.tensor(
+                [batch.batch["prompts"].shape[1]] * batch_size, dtype=torch.float32, device=batch.batch.device
+            )
+
+        return {
+            "prompt_length": prompt_lengths_tensor,
+            "response_length": response_lengths_tensor,
+            "max_response_length": resp_len,
+            "max_prompt_length": prompt_len,  # Or from config if fixed padding
+        }
+    except KeyError as e:
+        print(f"Warning: Missing key in _compute_response_info: {e}. Returning defaults.")
+        # Return default/dummy values if keys are missing
+        b_size = batch.batch.batch_size[0] if batch.batch.batch_size else 1
+        max_resp = batch.batch.get("responses").shape[1] if batch.batch.get("responses") is not None else 0
+        max_prompt = batch.batch.get("prompts").shape[1] if batch.batch.get("prompts") is not None else 0
+        return {
+            "prompt_length": torch.zeros(b_size),
+            "response_length": torch.zeros(b_size),
+            "max_response_length": max_resp,
+            "max_prompt_length": max_prompt,
+        }
+
+
+# --- Modified Metric Function ---
+def compute_dpo_data_metrics(batch: DataProto) -> dict[str, Any]:
+    """
+    Computes and returns metrics relevant for the DPO-like process.
+    """
+    metrics = {}
+    try:
+        # --- DPO Specific Metrics (if stored previously) ---
+        if "dpo_logits" in batch.batch and batch.batch["dpo_logits"] is not None:
+            metrics["actor/dpo_logits"] = batch.batch["dpo_logits"].mean().item()
+
+        if "chosen_logps" in batch.batch and batch.batch["chosen_logps"] is not None:
+            metrics["actor/chosen_logps"] = batch.batch["chosen_logps"].mean().item()
+
+        if "rejected_logps" in batch.batch and batch.batch["rejected_logps"] is not None:
+            metrics["actor/rejected_logps"] = batch.batch["rejected_logps"].mean().item()
+
+    except Exception as e:
+        print(f"ERROR in compute_dpo_data_metrics: {e}")
+        traceback.print_exc()
+
+    return metrics
+
+
+def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
+    responses = data.batch["responses"]
+    response_length = responses.size(1)
+    token_level_scores = data.batch["token_level_scores"]
+    batch_size = data.batch.batch_size[0]
+    attention_mask = data.batch["attention_mask"]
+    response_mask = attention_mask[:, -response_length:]
+
+    kld = core_algos.kl_penalty(
+        data.batch["old_log_probs"], data.batch["ref_log_prob"], kl_penalty=kl_penalty
+    )  # (batch_size, response_length)
+    kld = kld * response_mask
+    beta = kl_ctrl.value
+
+    token_level_rewards = token_level_scores - beta * kld
+
+    current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
+    current_kl = torch.mean(current_kl, dim=0).item()
+
+    kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
+    data.batch["token_level_rewards"] = token_level_rewards
+
+    metrics = {"actor/reward_kl_penalty": current_kl, "actor/reward_kl_penalty_coeff": beta}
+
+    return data, metrics
+
+
+def compute_response_mask(data: DataProto):
+    responses = data.batch["responses"]
+    response_length = responses.size(1)
+    attention_mask = data.batch["attention_mask"]
+    return attention_mask[:, -response_length:]
+
+
+def compute_onlineDPO_pref(data: DataProto):
+    rewards_tensor = data.batch.get("token_level_rewards")
+    mask_tensor = data.batch.get("response_mask")
+    if rewards_tensor is None or mask_tensor is None:
+        return data
+    try:
+        preferences = core_algos.compute_onlinedpo_pref(token_level_rewards=rewards_tensor, response_mask=mask_tensor)
+        data.batch["preferences"] = preferences
+    except Exception as e_pref:
+        print(f"ERROR during core_algos.compute_online_dpo_preference: {e_pref}")
+        traceback.print_exc()
+        data.batch["preferences"] = None
+    return data
+
+
+@contextmanager
+def _timer(name: str, timing_raw: dict[str, float]):
+    with Timer(name=name, logger=None) as timer:
+        yield
+    timing_raw[name] = timer.last
+
+
+class RayDPOTrainer:
+    def __init__(
+        self,
+        config,
+        tokenizer,
+        role_worker_mapping: dict[Role, WorkerType],
+        resource_pool_manager: ResourcePoolManager,
+        ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
+        processor=None,
+        reward_fn=None,
+        val_reward_fn=None,
+        train_dataset: Optional[Dataset] = None,
+        val_dataset: Optional[Dataset] = None,
+        collate_fn=None,
+        train_sampler: Optional[Sampler] = None,
+        device_name=None,
+    ):
+        self.tokenizer = tokenizer
+        self.processor = processor
+        self.config = config
+        self.reward_fn = reward_fn
+        self.val_reward_fn = val_reward_fn
+        self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
+        assert self.hybrid_engine, "Currently, only support hybrid engine"
+        if self.hybrid_engine:
+            assert Role.ActorRollout in role_worker_mapping, f"{role_worker_mapping.keys()=}"
+        self.role_worker_mapping = role_worker_mapping
+        self.resource_pool_manager = resource_pool_manager
+        self.use_reference_policy = Role.RefPolicy in role_worker_mapping
+        self.use_rm = Role.RewardModel in role_worker_mapping
+        self.ray_worker_group_cls = ray_worker_group_cls
+        self.validation_generations_logger = ValidationGenerationsLogger()
+        self.async_rollout_mode = False
+        self.device_name = device_name if device_name else self.config.trainer.device
+        if config.algorithm.use_kl_in_reward:
+            self.kl_ctrl_in_reward = core_algos.get_kl_controller(config.algorithm.kl_ctrl)
+        self.use_critic = False
+        self._validate_config()
+        self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _validate_config(self):
+        config = self.config
+        # number of GPUs total
+        n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+
+        # 1. Check total batch size for data correctness
+        real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
+        assert real_train_batch_size % n_gpus == 0, (
+            f"real_train_batch_size ({real_train_batch_size}) must be divisible by total n_gpus ({n_gpus})."
+        )
+
+        # A helper function to check "micro_batch_size" vs "micro_batch_size_per_gpu"
+        # We throw an error if the user sets both. The new convention is "..._micro_batch_size_per_gpu".
+        def check_mutually_exclusive(mbs, mbs_per_gpu, name: str):
+            settings = {
+                "actor_rollout_ref.actor": "micro_batch_size",
+                "critic": "micro_batch_size",
+                "reward_model": "micro_batch_size",
+                "actor_rollout_ref.ref": "log_prob_micro_batch_size",
+                "actor_rollout_ref.rollout": "log_prob_micro_batch_size",
+            }
+
+            if name in settings:
+                param = settings[name]
+                param_per_gpu = f"{param}_per_gpu"
+
+                if mbs is None and mbs_per_gpu is None:
+                    raise ValueError(
+                        f"[{name}] Please set at least one of '{name}.{param}' or '{name}.{param_per_gpu}'."
+                    )
+
+                if mbs is not None and mbs_per_gpu is not None:
+                    raise ValueError(
+                        f"[{name}] You have set both '{name}.{param}' AND '{name}.{param_per_gpu}'. "
+                        f"Please remove '{name}.{param}' because only '*_{param_per_gpu}' is supported "
+                        f"(the former is deprecated)."
+                    )
+
+        if not config.actor_rollout_ref.actor.use_dynamic_bsz:
+            # actor: ppo_micro_batch_size vs. ppo_micro_batch_size_per_gpu
+            check_mutually_exclusive(
+                config.actor_rollout_ref.actor.ppo_micro_batch_size,
+                config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu,
+                "actor_rollout_ref.actor",
+            )
+
+            if self.use_reference_policy:
+                # reference: log_prob_micro_batch_size vs. log_prob_micro_batch_size_per_gpu
+                check_mutually_exclusive(
+                    config.actor_rollout_ref.ref.log_prob_micro_batch_size,
+                    config.actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu,
+                    "actor_rollout_ref.ref",
+                )
+
+            #  The rollout section also has log_prob_micro_batch_size vs. log_prob_micro_batch_size_per_gpu
+            check_mutually_exclusive(
+                config.actor_rollout_ref.rollout.log_prob_micro_batch_size,
+                config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu,
+                "actor_rollout_ref.rollout",
+            )
+
+        if self.use_critic and not config.critic.use_dynamic_bsz:
+            # Check for critic micro-batch size conflicts
+            check_mutually_exclusive(
+                config.critic.ppo_micro_batch_size, config.critic.ppo_micro_batch_size_per_gpu, "critic"
+            )
+
+        # Check for reward model micro-batch size conflicts
+        if config.reward_model.enable and not config.reward_model.use_dynamic_bsz:
+            check_mutually_exclusive(
+                config.reward_model.micro_batch_size, config.reward_model.micro_batch_size_per_gpu, "reward_model"
+            )
+
+        # Actor
+        # check if train_batch_size is larger than ppo_mini_batch_size
+        # if NOT dynamic_bsz, we must ensure:
+        #    ppo_mini_batch_size is divisible by ppo_micro_batch_size
+        #    ppo_micro_batch_size * sequence_parallel_size >= n_gpus
+        if not config.actor_rollout_ref.actor.use_dynamic_bsz:
+            assert config.data.train_batch_size >= config.actor_rollout_ref.actor.ppo_mini_batch_size
+            sp_size = config.actor_rollout_ref.actor.get("ulysses_sequence_parallel_size", 1)
+            if config.actor_rollout_ref.actor.ppo_micro_batch_size is not None:
+                assert (
+                    config.actor_rollout_ref.actor.ppo_mini_batch_size
+                    % config.actor_rollout_ref.actor.ppo_micro_batch_size
+                    == 0
+                )
+                assert config.actor_rollout_ref.actor.ppo_micro_batch_size * sp_size >= n_gpus
+
+        assert config.actor_rollout_ref.actor.loss_agg_mode in [
+            "token-mean",
+            "seq-mean-token-sum",
+            "seq-mean-token-mean",
+        ], f"Invalid loss_agg_mode: {config.actor_rollout_ref.actor.loss_agg_mode}"
+
+        if config.algorithm.use_kl_in_reward and config.actor_rollout_ref.actor.use_kl_loss:
+            print("NOTICE: You have both enabled in-reward kl and kl loss.")
+
+        # critic
+        if self.use_critic and not config.critic.use_dynamic_bsz:
+            assert config.data.train_batch_size >= config.critic.ppo_mini_batch_size
+            sp_size = config.critic.get("ulysses_sequence_parallel_size", 1)
+            if config.critic.ppo_micro_batch_size is not None:
+                assert config.critic.ppo_mini_batch_size % config.critic.ppo_micro_batch_size == 0
+                assert config.critic.ppo_micro_batch_size * sp_size >= n_gpus
+
+        # Check if use_remove_padding is enabled when using sequence parallelism for fsdp
+        if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
+            if (
+                config.actor_rollout_ref.actor.get("ulysses_sequence_parallel_size", 1) > 1
+                or config.actor_rollout_ref.ref.get("ulysses_sequence_parallel_size", 1) > 1
+            ):
+                assert config.actor_rollout_ref.model.use_remove_padding, (
+                    "When using sequence parallelism for actor/ref policy, you must enable `use_remove_padding`."
+                )
+
+        if self.use_critic and config.critic.strategy in {"fsdp", "fsdp2"}:
+            if config.critic.get("ulysses_sequence_parallel_size", 1) > 1:
+                assert config.critic.model.use_remove_padding, (
+                    "When using sequence parallelism for critic, you must enable `use_remove_padding`."
+                )
+
+        if config.data.get("val_batch_size", None) is not None:
+            print(
+                "WARNING: val_batch_size is deprecated. Validation datasets are sent to inference engines "
+                "as a whole batch, which will schedule the memory themselves."
+            )
+
+        # check eval config
+        if config.actor_rollout_ref.rollout.val_kwargs.do_sample:
+            assert config.actor_rollout_ref.rollout.temperature > 0, (
+                "validation gen temperature should be greater than 0 when enabling do_sample"
+            )
+
+        print("[validate_config] All configuration checks passed successfully!")
+
+    # ==================== MODIFICATION START ====================
+    # 2. 修改数据加载逻辑，使其适配 OfflineDPODataset 和新的 collate_fn
+    def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler):
+        """
+        MODIFIED: Creates dataloaders for offline DPO training.
+        - Train dataloader uses OfflineDPODataset for preference pairs.
+        - Validation dataloader now correctly loads JSON files for prompts only.
+        """
+        from datasets import load_dataset
+        from verl.trainer.main_ppo import create_rl_sampler
+        from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
+
+        def dpo_collate_fn(batch):
+            collated_batch = default_collate(batch)
+            prompt_texts = collated_batch["prompt"]
+            prompt_tokens = self.tokenizer(prompt_texts, padding=True, truncation=False, return_tensors="pt")
+            prompt_lengths = prompt_tokens.attention_mask.sum(dim=1)
+            chosen_labels = collated_batch["chosen_input_ids"].clone()
+            rejected_labels = collated_batch["rejected_input_ids"].clone()
+            for i in range(len(prompt_lengths)):
+                prompt_len = prompt_lengths[i]
+                chosen_labels[i, :prompt_len] = -100
+                rejected_labels[i, :prompt_len] = -100
+            collated_batch["chosen_labels"] = chosen_labels
+            collated_batch["rejected_labels"] = rejected_labels
+            del collated_batch["prompt"]
+            del collated_batch["chosen_text"]
+            del collated_batch["rejected_text"]
+            return collated_batch
+
+        if train_dataset is None:
+            train_dataset = OfflineDPODataset(
+                data_files=self.config.data.train_files,
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+                config=self.config,
+            )
+
+        if val_dataset is None:
+            # ===> 关键修正 <===
+            # 1. 直接使用 Hugging Face datasets 加载 JSON 文件，避免 Parquet 错误
+            raw_val_dataset = load_dataset("json", data_files=self.config.data.val_files, split="train")
+            # print("==============================================")
+            # print(raw_val_dataset[0])  # 查看加载的数据结构，确保字段一致
+
+            # 2. 定义一个简单的 Dataset 类来处理 tokenization，只提取 prompt
+            class ValidationPromptDataset(Dataset):
+                def __init__(self, raw_dataset, tokenizer, config):
+                    self.raw_dataset = raw_dataset
+                    self.tokenizer = tokenizer
+                    self.prompt_key = config.data.get("prompt_key", "problem")
+                    self.solution_key = config.data.get("solution_key", "answer")
+                    self.data_source_key = config.data.data_source
+                    self.max_prompt_length = config.data.max_prompt_length
+
+                def __len__(self):
+                    return len(self.raw_dataset)
+
+                def __getitem__(self, idx):
+                    data_item = self.raw_dataset[idx]
+                    prompt = data_item["problem"]
+                    answer = data_item[self.solution_key]
+                    data_source = self.data_source_key
+                    extra_info = data_item.get("extra_info", {}) 
+                    num_turns = data_item.get("__num_turns__", None) 
+                    tokenized_prompt = self.tokenizer(
+                        prompt,
+                        max_length=self.max_prompt_length,
+                        padding="max_length",
+                        truncation=True,
+                        return_tensors="pt",
+                    )
+                    input_ids = tokenized_prompt["input_ids"].squeeze(0)
+                    attention_mask = tokenized_prompt["attention_mask"].squeeze(0)
+                    
+                    # ==> 新增逻辑：根据 input_ids 的长度创建 position_ids
+                    position_ids = torch.arange(0, input_ids.shape[0], dtype=torch.long)
+                    return {
+                        "input_ids": input_ids,
+                        "attention_mask": attention_mask,
+                        "position_ids": position_ids,
+                        "raw_prompt": prompt,
+                        "data_source": data_source,
+                        "extra_info": extra_info,
+                        "num_turns": num_turns,
+                        "reward_model": {"ground_truth": answer, "style":"rule"}
+                    }
+
+            val_dataset = ValidationPromptDataset(raw_val_dataset, self.tokenizer, self.config)
+
+        self.train_dataset, self.val_dataset = train_dataset, val_dataset
+
+        if train_sampler is None:
+            train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
+
+        self.train_dataloader = StatefulDataLoader(
+            dataset=self.train_dataset,
+            batch_size=self.config.data.train_batch_size,
+            num_workers=self.config.data.get("dataloader_num_workers", 8),
+            drop_last=True,
+            collate_fn=dpo_collate_fn,
+            sampler=train_sampler,
+        )
+
+        val_batch_size = self.config.data.get("val_batch_size", None)
+        if val_batch_size is None:
+            val_batch_size = len(self.val_dataset)
+        
+        self.val_dataloader = StatefulDataLoader(
+            dataset=self.val_dataset,
+            batch_size=val_batch_size,
+            num_workers=self.config.data.get("dataloader_num_workers", 8),
+            shuffle=False,
+            drop_last=False,
+            collate_fn=default_collate_fn,
+        )
+
+        assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
+        assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
+
+        print(
+            f"Size of train dataloader: {len(self.train_dataloader)}, "
+            f"Size of val dataloader: {len(self.val_dataloader)}"
+        )
+
+        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+        if self.config.trainer.total_training_steps is not None:
+            total_training_steps = self.config.trainer.total_training_steps
+        self.total_training_steps = total_training_steps
+        print(f"Total training steps: {self.total_training_steps}")
+
+        try:
+            OmegaConf.set_struct(self.config, True)
+            with open_dict(self.config):
+                if OmegaConf.select(self.config, "actor_rollout_ref.actor.optim"):
+                    self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
+                if OmegaConf.select(self.config, "critic.optim"):
+                    self.config.critic.optim.total_training_steps = total_training_steps
+        except Exception as e:
+            print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+    # ==================== MODIFICATION END ====================
+
+    def _maybe_log_val_generations(self, inputs, outputs, scores):
+        """Log a table of validation samples to the configured logger (wandb or swanlab)"""
+
+        generations_to_log = self.config.trainer.log_val_generations
+
+        if generations_to_log == 0:
+            return
+
+        import numpy as np
+
+        # Create tuples of (input, output, score) and sort by input text
+        samples = list(zip(inputs, outputs, scores, strict=True))
+        samples.sort(key=lambda x: x[0])  # Sort by input text
+
+        # Use fixed random seed for deterministic shuffling
+        rng = np.random.RandomState(42)
+        rng.shuffle(samples)
+
+        # Take first N samples after shuffling
+        samples = samples[:generations_to_log]
+
+        # Log to each configured logger
+        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+
+    def _validate(self):
+        data_source_lst = []
+        reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+
+        # Lists to collect samples for the table
+        sample_inputs = []
+        sample_outputs = []
+        sample_scores = []
+
+        for test_data in self.val_dataloader:
+            test_batch = DataProto.from_single_dict(test_data)
+
+            # repeat test batch
+            test_batch = test_batch.repeat(
+                repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
+            )
+
+            # we only do validation on rule-based rm
+            if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
+                return {}
+
+            # Store original inputs
+            input_ids = test_batch.batch["input_ids"]
+            # TODO: Can we keep special tokens except for padding tokens?
+            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            sample_inputs.extend(input_texts)
+
+            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+            # non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+            non_tensor_batch_keys_to_pop = []
+            if "multi_modal_inputs" in test_batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.extend(["multi_modal_data", "multi_modal_inputs"])
+            if "raw_prompt" in test_batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append("raw_prompt")
+            if "tools_kwargs" in test_batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append("tools_kwargs")
+            test_gen_batch = test_batch.pop(
+                batch_keys=batch_keys_to_pop,
+                non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+            )
+
+            test_gen_batch.meta_info = {
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "recompute_log_prob": False,
+                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                "validate": True,
+            }
+            # print("==============================")
+            # print(test_batch.keys())  # 打印所有键
+            # print("==============================")
+            print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
+
+            # pad to be divisible by dp_size
+            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
+            if not self.async_rollout_mode:
+                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+            else:
+                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+
+            # unpad
+            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            print("validation generation end")
+
+            # Store generated outputs
+            output_ids = test_output_gen_batch.batch["responses"]
+            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            sample_outputs.extend(output_texts)
+
+            test_batch = test_batch.union(test_output_gen_batch)
+
+            # evaluate using reward_function
+            result = self.val_reward_fn(test_batch, return_dict=True)
+            reward_tensor = result["reward_tensor"]
+            scores = reward_tensor.sum(-1).cpu().tolist()
+            sample_scores.extend(scores)
+
+            reward_extra_infos_dict["reward"].extend(scores)
+            if "reward_extra_info" in result:
+                for key, lst in result["reward_extra_info"].items():
+                    reward_extra_infos_dict[key].extend(lst)
+
+            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+
+        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+
+        # dump generations
+        val_data_dir = self.config.trainer.get("validation_data_dir", None)
+        if val_data_dir:
+            self._dump_generations(
+                inputs=sample_inputs,
+                outputs=sample_outputs,
+                scores=sample_scores,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                dump_path=val_data_dir,
+            )
+
+        for key_info, lst in reward_extra_infos_dict.items():
+            assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
+
+        data_sources = np.concatenate(data_source_lst, axis=0)
+        print(f"DEBUG: Data sources shape: {data_sources.shape}")  # Added Print
+        print(f"DEBUG: reward_extra_infos_dict keys before processing: {reward_extra_infos_dict.keys()}")  # Added Print
+
+        data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
+        print(
+            f"DEBUG: Output of process_validation_metrics (data_src2var2metric2val): {data_src2var2metric2val}"
+        )  # Added Print
+        metric_dict = {}
+        for data_source, var2metric2val in data_src2var2metric2val.items():
+            core_var = "acc" if "acc" in var2metric2val else "reward"
+            for var_name, metric2val in var2metric2val.items():
+                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+                for metric_name, metric_val in metric2val.items():
+                    if (
+                        (var_name == core_var)
+                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
+                        and (f"@{n_max}" in metric_name)
+                    ):
+                        metric_sec = "val-core"
+                    else:
+                        metric_sec = "val-aux"
+                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
+                    metric_dict[pfx] = metric_val
+
+        return metric_dict
+
+    def init_workers(self):
+        """Init resource pool and worker group"""
+        self.resource_pool_manager.create_resource_pool()
+
+        self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
+
+        # create actor and rollout
+        if self.hybrid_engine:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+            actor_rollout_cls = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[Role.ActorRollout],
+                config=self.config.actor_rollout_ref,
+                role="actor_rollout",
+            )
+            self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
+        else:
+            raise NotImplementedError
+
+        # create critic
+        if self.use_critic:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
+            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=self.config.critic)
+            self.resource_pool_to_cls[resource_pool]["critic"] = critic_cls
+
+        # create reference policy if needed
+        if self.use_reference_policy:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
+            ref_policy_cls = RayClassWithInitArgs(
+                self.role_worker_mapping[Role.RefPolicy], config=self.config.actor_rollout_ref, role="ref"
+            )
+            self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
+
+        # create a reward model if reward_fn is None
+        if self.use_rm:
+            # we create a RM here
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+            rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
+            self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
+
+        # initialize WorkerGroup
+        # NOTE: if you want to use a different resource pool for each role, which can support different
+        # parallel size,
+        # you should not use `create_colocated_worker_cls`. Instead, directly pass different resource pool to
+        # different worker groups.
+        # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
+        all_wg = {}
+        self.wg_dicts = []
+        wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
+        if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
+            wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
+        wg_kwargs["device_name"] = self.device_name
+
+        for resource_pool, class_dict in self.resource_pool_to_cls.items():
+            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+            wg_dict = self.ray_worker_group_cls(
+                resource_pool=resource_pool,
+                ray_cls_with_init=worker_dict_cls,
+                **wg_kwargs,
+            )
+            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+            all_wg.update(spawn_wg)
+            # keep the referece of WorkerDict to support ray >= 2.31. Ref: https://github.com/ray-project/ray/pull/45699
+            self.wg_dicts.append(wg_dict)
+
+        if self.use_critic:
+            self.critic_wg = all_wg["critic"]
+            self.critic_wg.init_model()
+
+        if self.use_reference_policy:
+            self.ref_policy_wg = all_wg["ref"]
+            self.ref_policy_wg.init_model()
+
+        if self.use_rm:
+            self.rm_wg = all_wg["rm"]
+            self.rm_wg.init_model()
+
+        # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
+        self.actor_rollout_wg = all_wg["actor_rollout"]
+        self.actor_rollout_wg.init_model()
+
+    def _save_checkpoint(self):
+        # path: given_path + `/global_step_{global_steps}` + `/actor`
+        local_global_step_folder = os.path.join(
+            self.config.trainer.default_local_dir, f"global_step_{self.global_steps}"
+        )
+
+        print(f"local_global_step_folder: {local_global_step_folder}")
+        actor_local_path = os.path.join(local_global_step_folder, "actor")
+
+        actor_remote_path = (
+            None
+            if self.config.trainer.default_hdfs_dir is None
+            else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "actor")
+        )
+
+        remove_previous_ckpt_in_save = self.config.trainer.get("remove_previous_ckpt_in_save", False)
+        if remove_previous_ckpt_in_save:
+            print(
+                "Warning: remove_previous_ckpt_in_save is deprecated, set max_actor_ckpt_to_keep=1 and "
+                "max_critic_ckpt_to_keep=1 instead"
+            )
+        max_actor_ckpt_to_keep = (
+            self.config.trainer.get("max_actor_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
+        )
+        max_critic_ckpt_to_keep = (
+            self.config.trainer.get("max_critic_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
+        )
+
+        self.actor_rollout_wg.save_checkpoint(
+            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
+        )
+
+        if self.use_critic:
+            critic_local_path = os.path.join(local_global_step_folder, "critic")
+            critic_remote_path = (
+                None
+                if self.config.trainer.default_hdfs_dir is None
+                else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "critic")
+            )
+            self.critic_wg.save_checkpoint(
+                critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
+            )
+
+        # save dataloader
+        dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
+        dataloader_state_dict = self.train_dataloader.state_dict()
+        torch.save(dataloader_state_dict, dataloader_local_path)
+
+        # latest checkpointed iteration tracker (for atomic usage)
+        local_latest_checkpointed_iteration = os.path.join(
+            self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
+        )
+        with open(local_latest_checkpointed_iteration, "w") as f:
+            f.write(str(self.global_steps))
+
+    def _load_checkpoint(self):
+        if self.config.trainer.resume_mode == "disable":
+            return 0
+
+        # load from hdfs
+        if self.config.trainer.default_hdfs_dir is not None:
+            raise NotImplementedError("load from hdfs is not implemented yet")
+        else:
+            checkpoint_folder = self.config.trainer.default_local_dir  # TODO: check path
+            if not os.path.isabs(checkpoint_folder):
+                working_dir = os.getcwd()
+                checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
+            global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
+
+        # find global_step_folder
+        if self.config.trainer.resume_mode == "auto":
+            if global_step_folder is None:
+                print("Training from scratch")
+                return 0
+        else:
+            if self.config.trainer.resume_mode == "resume_path":
+                assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
+                assert "global_step_" in self.config.trainer.resume_from_path, (
+                    "resume ckpt must specify the global_steps"
+                )
+                global_step_folder = self.config.trainer.resume_from_path
+                if not os.path.isabs(global_step_folder):
+                    working_dir = os.getcwd()
+                    global_step_folder = os.path.join(working_dir, global_step_folder)
+        print(f"Load from checkpoint folder: {global_step_folder}")
+        # set global step
+        self.global_steps = int(global_step_folder.split("global_step_")[-1])
+
+        print(f"Setting global step to {self.global_steps}")
+        print(f"Resuming from {global_step_folder}")
+
+        actor_path = os.path.join(global_step_folder, "actor")
+        critic_path = os.path.join(global_step_folder, "critic")
+        # load actor
+        self.actor_rollout_wg.load_checkpoint(
+            actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
+        )
+        # load critic
+        if self.use_critic:
+            self.critic_wg.load_checkpoint(
+                critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
+            )
+
+        # load dataloader,
+        # TODO: from remote not implemented yet
+        dataloader_local_path = os.path.join(global_step_folder, "data.pt")
+        if os.path.exists(dataloader_local_path):
+            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+            self.train_dataloader.load_state_dict(dataloader_state_dict)
+        else:
+            print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+
+    def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
+        """Reorder the data on single controller such that each dp rank gets similar total tokens"""
+        attention_mask = batch.batch["attention_mask"]
+        batch_size = attention_mask.shape[0]
+        global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
+        world_size = self.actor_rollout_wg.world_size
+        global_partition_lst = get_seqlen_balanced_partitions(
+            global_seqlen_lst, k_partitions=world_size, equal_size=True
+        )
+        # reorder based on index. The data will be automatically equally partitioned by dispatch function
+        global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
+        batch.reorder(global_idx)
+        global_balance_stats = log_seqlen_unbalance(
+            seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix
+        )
+        metrics.update(global_balance_stats)
+
+    # ==================== MODIFICATION START ====================
+    # 4. 重构核心训练循环 fit_dpo 以适应 Offline DPO
+    def fit_dpo(self):
+        """
+        MODIFIED: The training loop for OFFLINE DPO.
+        This loop directly loads preference pairs from the dataloader and
+        skips the online generation and reward calculation steps.
+        """
+        import traceback
+        from omegaconf import OmegaConf
+        from verl.utils.tracking import Tracking
+
+        # --- 1. 初始化 (与原版相同) ---
+        logger = None
+        try:
+            logger = Tracking(
+                project_name=self.config.trainer.project_name,
+                experiment_name=self.config.trainer.experiment_name,
+                default_backend=self.config.trainer.logger,
+                config=OmegaConf.to_container(self.config, resolve=True, throw_on_missing=False),
+            )
+        except Exception as e:
+            print(f"Warning: Failed to initialize logger: {e}")
+
+        self.global_steps = 0
+        loaded_step = self._load_checkpoint()
+        self.global_steps = loaded_step + 1 if loaded_step is not None and loaded_step > 0 else 1
+        print(f"Starting OFFLINE DPO training from global step {self.global_steps}. Total steps: {self.total_training_steps}")
+
+        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+            print("Running validation before OFFLINE DPO training...")
+            val_metrics = self._validate()
+            if logger and val_metrics:
+                logger.log(data=val_metrics, step=max(0, self.global_steps - 1))
+            if self.config.trainer.get("val_only", False):
+                print("Validation only mode enabled. Exiting training.")
+                if logger and hasattr(logger, "finish"):
+                    logger.finish()
+                return
+
+        progress_bar = tqdm(
+            total=self.total_training_steps,
+            initial=self.global_steps,
+            desc="Offline DPO Training Progress",
+            position=0,
+            leave=True,
+        )
+        
+        last_val_metrics = None
+        should_stop = False
+
+        # --- 2. 训练循环 ---
+        for epoch in range(self.config.trainer.total_epochs):
+            if should_stop:
+                break
+            print(f"--- Starting OFFLINE DPO Epoch {epoch} ---")
+            train_iterator = iter(self.train_dataloader)
+
+            for batch_idx, batch_dict in enumerate(train_iterator):
+                if self.global_steps > self.total_training_steps:
+                    should_stop = True
+                    break
+
+                metrics = {}
+                timing_raw = {}
+                step_timer = Timer(logger=None)
+
+                try:
+                    step_timer.start()
+                    with _timer("step", timing_raw):
+                        # --- 3. 计算参考模型的对数概率 ---
+                        ref_log_prob_computed = False
+                        if self.use_reference_policy:
+                            with _timer("ref_log_prob_dpo", timing_raw):
+                                # 准备用于计算 ref log prob 的批次
+                                chosen_input_ids = batch_dict["chosen_input_ids"]
+                                rejected_input_ids = batch_dict["rejected_input_ids"]
+                                chosen_attention_mask = batch_dict["chosen_attention_mask"]
+                                rejected_attention_mask = batch_dict["rejected_attention_mask"]
+                                chosen_labels = batch_dict["chosen_labels"]
+                                rejected_labels = batch_dict["rejected_labels"]
+
+                                # 构造拼接后的 input_ids，以便为其创建 position_ids
+                                concatenated_input_ids = torch.cat([chosen_input_ids, rejected_input_ids], dim=0)
+                                # 根据拼接后序列的长度，为每一条数据创建 position_ids
+                                batch_size, seq_len = concatenated_input_ids.shape
+                                
+                                position_ids = torch.arange(seq_len, device=concatenated_input_ids.device).unsqueeze(0).expand(batch_size, -1)
+                                ref_batch_tensors = {
+                                    "input_ids": torch.cat([chosen_input_ids, rejected_input_ids], dim=0),
+                                    "attention_mask": torch.cat([chosen_attention_mask, rejected_attention_mask], dim=0),
+                                    "responses": torch.cat([chosen_input_ids, rejected_input_ids], dim=0),
+                                    "response_mask": torch.cat([chosen_labels != -100, rejected_labels != -100], dim=0).long(),
+                                    "position_ids": position_ids,
+                                }
+                                ref_batch_proto = DataProto.from_dict(tensors=ref_batch_tensors)
+                                
+                                try:
+                                    ref_log_prob_output = self.ref_policy_wg.compute_ref_log_prob(ref_batch_proto)
+                                    full_ref_log_probs = ref_log_prob_output.batch["ref_log_prob"]
+                                    
+                                    ref_chosen_token_logps, ref_rejected_token_logps = torch.chunk(full_ref_log_probs, 2, dim=0)
+
+                                    chosen_mask = (batch_dict["chosen_labels"] != -100)
+                                    rejected_mask = (batch_dict["rejected_labels"] != -100)
+
+                                    reference_chosen_logps = (ref_chosen_token_logps * chosen_mask).sum(-1)
+                                    reference_rejected_logps = (ref_rejected_token_logps * rejected_mask).sum(-1)
+                                    
+                                    ref_log_prob_computed = True
+                                except Exception as ref_e:
+                                    print(f"ERROR computing reference log probs: {ref_e}")
+                                    traceback.print_exc()
+                        
+                        if not ref_log_prob_computed:
+                            raise RuntimeError("Failed to compute reference log probabilities, which are required for DPO.")
+
+                        # --- 4. 准备最终的DPO更新批次 ---
+                        dpo_update_tensors = {
+                            "chosen_input_ids": batch_dict["chosen_input_ids"],
+                            "chosen_attention_mask": batch_dict["chosen_attention_mask"],
+                            "chosen_labels": batch_dict["chosen_labels"],
+                            "rejected_input_ids": batch_dict["rejected_input_ids"],
+                            "rejected_attention_mask": batch_dict["rejected_attention_mask"],
+                            "rejected_labels": batch_dict["rejected_labels"],
+                            "reference_chosen_logps": reference_chosen_logps,
+                            "reference_rejected_logps": reference_rejected_logps,
+                        }
+                        dpo_update_batch_proto = DataProto.from_dict(tensors=dpo_update_tensors)
+
+                        # --- 5. 模型更新 ---
+                        print(f"--- Updating actor ---")
+                        actor_output = None
+                        with _timer("update_actor", timing_raw):
+                            actor_output = self.actor_rollout_wg.update_actor_dpo(dpo_update_batch_proto)
+                        
+                        if actor_output and "metrics" in actor_output.meta_info:
+                            metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
+                    
+                    # --- 6. 度量计算、日志、验证、保存 (与原版类似) ---
+                    metrics.update(compute_timing_metrics(batch=dpo_update_batch_proto, timing_raw=timing_raw))
+                    n_gpus = self.resource_pool_manager.get_n_gpus()
+                    if "step" in timing_raw:
+                        metrics.update(compute_throughout_metrics(batch=dpo_update_batch_proto, timing_raw=timing_raw, n_gpus=n_gpus))
+
+                    step_timer.stop()
+                    metrics["time/step"] = step_timer.last
+
+                    test_freq = OmegaConf.select(self.config.trainer, "test_freq", default=-1)
+                    is_last_step = self.global_steps >= self.total_training_steps
+                    if (
+                        self.val_reward_fn is not None
+                        and test_freq > 0
+                        and (is_last_step or self.global_steps % test_freq == 0)
+                    ):
+                        val_timing_raw = {}
+                        with _timer("testing", val_timing_raw):
+                            val_metrics: dict = self._validate()
+                        if is_last_step:
+                            last_val_metrics = val_metrics
+                        if val_metrics:
+                            metrics["time/validation_run"] = val_timing_raw.get("testing", 0)
+                            metrics.update(val_metrics)
+
+                    save_freq = OmegaConf.select(self.config.trainer, "save_freq", default=-1)
+                    if save_freq > 0 and (is_last_step or self.global_steps % save_freq == 0):
+                        with _timer("save_checkpoint", timing_raw):
+                            self._save_checkpoint()
+                        metrics["time/save_checkpoint"] = timing_raw.get("save_checkpoint", 0)
+
+                    log_freq = OmegaConf.select(self.config.trainer, "log_freq", default=1)
+                    if logger and self.global_steps % log_freq == 0:
+                        logger.log(data=metrics, step=self.global_steps)
+
+                    progress_bar.set_postfix({k: f"{v:.3f}" if isinstance(v, float) else v for k, v in metrics.items() if isinstance(v, (int, float))})
+
+                except Exception as step_e:
+                    print(f"\n!!!!!!!! ERROR DURING OFFLINE DPO Step {self.global_steps} !!!!!!!!")
+                    traceback.print_exc()
+                    should_stop = True
+                    break
+                
+                if is_last_step or should_stop:
+                    print(f"Stopping DPO training at step {self.global_steps}.")
+                    break
+
+                self.global_steps += 1
+                progress_bar.update(1)
+
+            if hasattr(self.train_dataloader, "reset"):
+                try:
+                    self.train_dataloader.reset()
+                except Exception as e:
+                    print(f"Warning: Failed to reset train dataloader state: {e}")
+            if should_stop:
+                break
+        
+        # --- 7. 训练结束 (与原版相同) ---
+        progress_bar.close()
+        final_step = max(0, self.global_steps - 1)
+        print(f"Offline DPO Training finished at step {final_step}.")
+        save_freq = OmegaConf.select(self.config.trainer, "save_freq", default=-1)
+        if not self.config.trainer.get("val_only", False) and (save_freq <= 0 or final_step % save_freq != 0):
+            print(f"Saving final DPO checkpoint at step {final_step}...")
+            self._save_checkpoint()
+
+        if self.val_reward_fn and last_val_metrics is None and not self.config.trainer.get("val_only", False):
+            print("Running final validation...")
+            last_val_metrics = self._validate()
+            if last_val_metrics and logger:
+                last_val_metrics["final_validation"] = True
+                try:
+                    logger.log(data=last_val_metrics, step=final_step)
+                except Exception as e:
+                    print(f"[Final Val Metrics Log Error]: {e}")
+
+        pprint(f"Final validation metrics: {last_val_metrics}")
+        if logger and hasattr(logger, "finish"):
+            logger.finish()
+        print("Offline DPO Training Run Complete.")
+    # ==================== MODIFICATION END ====================
+

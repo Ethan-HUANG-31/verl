@@ -1,0 +1,79 @@
+# =================================================================
+#           Offline DPO Trainer Configuration File (Final Version)
+# =================================================================
+# 该文件为 offline DPO 训练专门配置。
+# 它继承自 ppo_trainer.yaml，并覆盖了数据、算法和模型路径等关键参数。
+
+# 继承基础的 ppo_trainer.yaml，然后用当前文件的设置进行覆盖
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# DPO 算法相关的超参数
+algorithm:
+  beta: 0.1             # DPO 损失函数中的 beta 超参数
+  loss_type: "dpo"      # 损失类型
+  # adv_estimator 设为 null，因为 DPO 不使用 GAE 等优势估计
+  adv_estimator: null
+
+# 数据集相关配置
+data:
+  train_files:
+    - "recipe/dpo/data/DeepSeek-R1-Distill-Qwen-1.5B_math_n0_K16_len16384_compressed_think_nothink.jsonl"
+
+  val_files:
+    - "recipe/dpo/data/math.json"
+  
+  data_source: "HuggingFaceH4/MATH-500"
+
+
+  # 这两个参数会传递给您的 OfflineDPODataset
+  max_prompt_length: 1024
+  max_response_length: 16384
+
+  train_batch_size: 128
+  eval_batch_size: 512
+  num_workers: 8 # 在本地调试时建议设为 0，在服务器上可以设为 4 或 8
+
+# actor_rollout_ref 包含了 Actor 和 Reference 模型的所有配置
+actor_rollout_ref:
+  # 模型路径配置
+  model:
+    # !!! 重要: 请将这里的路径修改为您 SFT 模型的实际路径 !!!
+    # dpo_trainer.py 中的 TaskRunner 会读取这个路径
+    path: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+    torch_dtype: bfloat16
+  
+  actor:
+    # 将所有优化器和学习率调度器的配置统一放在这里
+    # dpo_trainer.py 中的 FSDPWorker 会读取这个配置块
+    dpo_beta: 0.1
+    optim:
+      lr_warmup_steps: 15  
+  
+  rollout:
+    name: vllm
+    tensor_model_parallel_size: 2
+    gpu_memory_utilization: 0.9
+    temperatur: 0.6
+    val_temperature: 0.6
+    val_kwargs:
+      n: 2  # 2 will trigger validation, 1 will bypass
+    max_model_len: 1024  # 保持与 max_prompt_length 相同
+    max_num_batched_tokens: 139264
+
+
+# 训练流程控制
+trainer:
+  epochs: 1
+  gradient_accumulation_steps: 8 # 梯度累积步数
+  save_freq: 30                # 每隔多少步保存一次模型
+  log_val_generations: 16        # 在验证时，打印多少个样本的生成结果到日志中
+  project_name: "offline-dpo-project"
+  experiment_name: "dpo_math_DeepSeek-R1-Distill-Qwen-1.5B"
+  logger: ['console','wandb']
+
